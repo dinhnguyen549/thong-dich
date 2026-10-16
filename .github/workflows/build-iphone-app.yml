@@ -1,0 +1,102 @@
+# Builds the iPhone app on GitHub's free Mac computers and publishes two installable files:
+#   ThongDich.ipa         – recommended (asks iOS for extra memory for the AI model)
+#   ThongDich-compat.ipa  – use only if your installer rejects the first one
+# Run it from the "Actions" tab → "Build iPhone app" → "Run workflow". It also runs on every push.
+
+name: Build iPhone app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Use Xcode 26
+        run: |
+          if [ -d /Applications/Xcode_26.6.app ]; then sudo xcode-select -s /Applications/Xcode_26.6.app; fi
+          xcodebuild -version
+
+      - name: Install Metal toolchain (needed by MLX GPU kernels)
+        run: xcodebuild -downloadComponent MetalToolchain || echo "Metal toolchain already present"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: SourcePackages
+          key: spm-${{ hashFiles('ThongDichKit/Package.swift') }}
+
+      - name: Resolve packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project ThongDich.xcodeproj -scheme ThongDich \
+            -clonedSourcePackagesDirPath SourcePackages \
+            -skipMacroValidation -skipPackagePluginValidation
+
+      - name: Build (Release, iPhone)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ThongDich.xcodeproj -scheme ThongDich \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build -clonedSourcePackagesDirPath SourcePackages \
+            -skipMacroValidation -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log | grep -E "error:|warning: unre|\*\* BUILD" || true
+          if ! grep -q "BUILD SUCCEEDED" build.log; then
+            echo "## Build errors" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "error:" build.log | sort -u | head -80 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "error:" build.log | sort -u | head -80
+            exit 1
+          fi
+
+      - name: Package .ipa files
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "App: $APP"
+          mkdir -p out/compat/Payload out/main/Payload
+          cp -R "$APP" out/compat/Payload/
+          cp -R "$APP" out/main/Payload/
+          # Compatibility build: unsigned, no special permissions
+          (cd out/compat && zip -qry ../ThongDich-compat.ipa Payload)
+          # Main build: ad-hoc signature carrying the "increased memory limit" permission.
+          # Sideloadly / AltStore re-sign it with your Apple ID and keep this permission.
+          MAIN_APP="out/main/Payload/$(basename "$APP")"
+          if [ -d "$MAIN_APP/Frameworks" ]; then
+            find "$MAIN_APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -exec codesign --force --sign - --timestamp=none {} \;
+          fi
+          codesign --force --sign - --timestamp=none --entitlements Config/ThongDich.entitlements "$MAIN_APP"
+          codesign -d --entitlements - "$MAIN_APP" || true
+          (cd out/main && zip -qry ../ThongDich.ipa Payload)
+          ls -lh out/*.ipa
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThongDich-iPhone-app
+          path: |
+            out/ThongDich.ipa
+            out/ThongDich-compat.ipa
+          retention-days: 30
+
+      - name: Upload build log (for troubleshooting)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
